@@ -200,8 +200,18 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ─── User Handlers ──────────────────────────────────────────────────
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/start — Bare minimum diagnostic test."""
-    await update.message.reply_text("welcome")
+    """/start — Welcome message with explicit clickable commands."""
+    user = update.effective_user
+    await update.message.reply_text(
+        f"👋 Welcome, {user.first_name}!\n\n"
+        f"I deliver daily newspaper PDFs straight to your Telegram.\n\n"
+        f"📋 *Available Plans:*\n"
+        f"  📰 *The Hindu* — ₹69/month  →  /buy_hindu\n"
+        f"  📰 *Times of India* — ₹65/month  →  /buy_toi\n\n"
+        f"After purchasing, use /paid_hindu or /paid_toi to notify us.\n"
+        f"Check your subscription with /myplan.",
+        parse_mode="Markdown",
+    )
 
 
 async def buy_hindu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
