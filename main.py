@@ -215,12 +215,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def buy_hindu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/buy_hindu — Show The Hindu plan details and QR code."""
+    """/buyhindu — Show The Hindu plan details and QR code."""
     qr_path = ASSETS_DIR / "qr.png"
     text = (
         "📰 The Hindu — ₹69/month\n\n"
         "Scan the QR code below to pay via UPI.\n"
-        "After payment, click /paid_hindu to notify us!"
+        "After payment, click /paidhindu to notify us!"
     )
     if qr_path.exists():
         try:
@@ -232,12 +232,12 @@ async def buy_hindu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def buy_toi_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/buy_toi — Show TOI plan details and QR code."""
+    """/buytoi — Show TOI plan details and QR code."""
     qr_path = ASSETS_DIR / "qr.png"
     text = (
         "📰 Times of India — ₹65/month\n\n"
         "Scan the QR code below to pay via UPI.\n"
-        "After payment, click /paid_toi to notify us!"
+        "After payment, click /paidtoi to notify us!"
     )
     if qr_path.exists():
         try:
@@ -438,10 +438,13 @@ def main() -> None:
 
     # ── User commands ──
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("buy_hindu", buy_hindu_command))
-    app.add_handler(CommandHandler("buy_toi", buy_toi_command))
-    app.add_handler(CommandHandler("paid_hindu", paid_hindu_command))
-    app.add_handler(CommandHandler("paid_toi", paid_toi_command))
+    
+    # Changed to match the stubborn welcome message exactly
+    app.add_handler(CommandHandler("buyhindu", buy_hindu_command))
+    app.add_handler(CommandHandler("buytoi", buy_toi_command))
+    app.add_handler(CommandHandler("paidhindu", paid_hindu_command))
+    app.add_handler(CommandHandler("paidtoi", paid_toi_command))
+    
     app.add_handler(CommandHandler("myplan", myplan_command))
 
     # ── Scheduled jobs ──
