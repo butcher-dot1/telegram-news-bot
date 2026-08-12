@@ -1,10 +1,28 @@
 """
-Telegram Subscription Bot — Main Entry Point
-=============================================
+Telegram Newspaper Subscription Bot
+===================================
 
-Admin uploads daily PDFs, approves users.
-Users purchase plans, receive papers on schedule.
-JobQueue handles daily broadcast and cleanup.
+Customer-facing model:
+    ONE subscription — All Newspapers — ₹29/month
+
+Included:
+    • The Hindu
+    • Times of India
+    • Indian Express
+
+Customer commands:
+    /start
+    /buy
+    /paid
+    /myplan
+
+Admin commands:
+    /approve <user_id>
+    /debug
+
+The existing database is intentionally preserved.
+Internally, approval activates all three existing newspaper keys
+for the same 30-day subscription, so db.py does not need to change.
 """
 
 import os
@@ -12,18 +30,27 @@ import logging
 import threading
 from pathlib import Path
 from datetime import time, timezone, timedelta, datetime, date
+from functools import wraps
 
 from dotenv import load_dotenv
-from telegram import Update, Document
+
+from telegram import (
+    Update,
+    Document,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     ConversationHandler,
     filters,
 )
 from telegram.request import HTTPXRequest
+
 from fastapi import FastAPI
 import uvicorn
 
@@ -36,45 +63,50 @@ import db
 
 load_dotenv()
 
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID: int = int(os.getenv("ADMIN_ID", "0"))
 
-# Optional Telegram proxy. Leave empty for direct connection.
-# Set PROXY_URL as a Hugging Face Secret if a proxy is required.
+# Existing Vercel proxy setup.
 PROXY_URL: str = os.getenv("PROXY_URL", "").strip()
+PROXY_SECRET: str = os.getenv("PROXY_SECRET", "").strip()
 
 ASSETS_DIR: Path = Path(__file__).parent / "assets"
 
-# Indian Standard Time — UTC +5:30
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# Daily schedules
+# Keep your current schedule.
 IST_BROADCAST_TIME = time(
-    hour=12,
-    minute=40,
+    hour=7,
+    minute=30,
     tzinfo=IST,
 )
 
 IST_CLEANUP_TIME = time(
-    hour=2,
+    hour=4,
     minute=0,
     tzinfo=IST,
 )
 
-# Plans
+# One customer-facing subscription.
+SUBSCRIPTION_NAME = "All Newspapers"
+SUBSCRIPTION_PRICE = "₹29/month"
+SUBSCRIPTION_DAYS = 30
+
+# Existing DB newspaper identifiers.
+# These are NOT separate customer plans anymore.
+NEWSPAPERS = {
+    "hindu": "The Hindu",
+    "toi": "Times of India",
+    "ie": "Indian Express",
+}
+
+# Compatibility structure for existing DB/paper records.
 PLANS = {
-    "hindu": {
-        "name": "The Hindu",
-        "price": "₹29/month",
-    },
-    "toi": {
-        "name": "Times of India",
-        "price": "₹29/month",
-    },
-    "ie": {
-        "name": "Indian Express",
-        "price": "₹29/month",
-    },
+    code: {
+        "name": name,
+        "price": SUBSCRIPTION_PRICE,
+    }
+    for code, name in NEWSPAPERS.items()
 }
 
 
@@ -89,12 +121,7 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-
-# ─────────────────────────────────────────────────────────────────────
-# ConversationHandler states
-# ─────────────────────────────────────────────────────────────────────
-
-AWAITING_PLAN_NAME = 0
+AWAITING_NEWSPAPER_NAME = 0
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -102,16 +129,16 @@ AWAITING_PLAN_NAME = 0
 # ─────────────────────────────────────────────────────────────────────
 
 def admin_only(func):
-    """Restrict a command to the admin only."""
+    """Allow only the configured admin to use the handler."""
 
+    @wraps(func)
     async def wrapper(
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ):
-        if not update.effective_user:
-            return
+        user = update.effective_user
 
-        if update.effective_user.id != ADMIN_ID:
+        if not user or user.id != ADMIN_ID:
             return
 
         return await func(update, context)
@@ -120,22 +147,18 @@ def admin_only(func):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Admin PDF upload conversation
+# Admin PDF upload
 # ─────────────────────────────────────────────────────────────────────
 
 async def handle_pdf_received(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
-    """
-    Admin sends a PDF.
-    Store its Telegram file_id and ask which plan it belongs to.
-    """
+    """Admin sends a newspaper PDF."""
 
-    if not update.effective_user:
-        return ConversationHandler.END
+    user = update.effective_user
 
-    if update.effective_user.id != ADMIN_ID:
+    if not user or user.id != ADMIN_ID:
         return ConversationHandler.END
 
     if not update.message or not update.message.document:
@@ -151,91 +174,87 @@ async def handle_pdf_received(
 
     context.user_data["pending_file_id"] = document.file_id
 
-    plan_list = "\n".join(
-        f"  • `{key}` — {value['name']}"
-        for key, value in PLANS.items()
+    newspaper_list = "\n".join(
+        f"  • `{code}` — {name}"
+        for code, name in NEWSPAPERS.items()
     )
 
     await update.message.reply_text(
-        "📄 PDF received!\n\n"
-        "Which plan is this for?\n"
-        f"{plan_list}\n\n"
-        "Reply with the plan code "
-        "(for example: `hindu` or `toi`).",
+        "📄 *NEWSPAPER RECEIVED*\n\n"
+        "Which newspaper is this PDF for?\n\n"
+        f"{newspaper_list}\n\n"
+        "Reply with the code, for example `hindu`.",
         parse_mode="Markdown",
     )
 
-    return AWAITING_PLAN_NAME
+    return AWAITING_NEWSPAPER_NAME
 
 
-async def handle_plan_name_reply(
+async def handle_newspaper_name_reply(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
-    """
-    Admin replies with the plan name after sending a PDF.
-    """
+    """Admin identifies the newspaper for the uploaded PDF."""
 
-    if not update.effective_user:
-        return ConversationHandler.END
+    user = update.effective_user
 
-    if update.effective_user.id != ADMIN_ID:
+    if not user or user.id != ADMIN_ID:
         return ConversationHandler.END
 
     if not update.message or not update.message.text:
-        return AWAITING_PLAN_NAME
+        return AWAITING_NEWSPAPER_NAME
 
-    plan_name = update.message.text.strip().lower()
-
+    newspaper_code = update.message.text.strip().lower()
     file_id = context.user_data.get("pending_file_id")
 
-    if plan_name not in PLANS:
+    if newspaper_code not in NEWSPAPERS:
         await update.message.reply_text(
-            f"❌ Unknown plan `{plan_name}`.\n\n"
-            f"Valid plans: {', '.join(PLANS.keys())}",
+            "❌ Unknown newspaper code.\n\n"
+            "Use one of:\n"
+            "• `hindu`\n"
+            "• `toi`\n"
+            "• `ie`",
             parse_mode="Markdown",
         )
-        return AWAITING_PLAN_NAME
+        return AWAITING_NEWSPAPER_NAME
 
     if not file_id:
         await update.message.reply_text(
-            "❌ No pending PDF found.\n"
-            "Please send the PDF first."
+            "❌ No pending PDF found. Please send the PDF again."
         )
         return ConversationHandler.END
 
-    # Save the paper in database
-    await db.add_paper(plan_name, file_id)
+    await db.add_paper(newspaper_code, file_id)
 
     context.user_data.pop("pending_file_id", None)
 
-    # Check current IST time
     now_ist = datetime.now(IST).time()
 
+    # IMPORTANT:
+    # The scheduled job is only a fallback. If the admin uploads the
+    # newspaper after the scheduled time, distribute it immediately.
     if now_ist >= IST_BROADCAST_TIME:
         await update.message.reply_text(
-            "⏳ It's already past 12:40 PM!\n"
-            "Broadcasting immediately to all subscribers..."
+            "⏰ The scheduled broadcast time has passed.\n\n"
+            "📡 Sending this newspaper to all active subscribers now..."
         )
 
         count = await broadcast_paper(
             context.bot,
-            plan_name,
+            newspaper_code,
             file_id,
         )
 
         await update.message.reply_text(
-            f"✅ Paper saved and sent to {count} users "
-            f"for *{PLANS[plan_name]['name']}*!",
+            f"✅ *{NEWSPAPERS[newspaper_code]}* saved.\n\n"
+            f"📤 Sent to *{count}* active subscriber(s).",
             parse_mode="Markdown",
         )
-
     else:
         await update.message.reply_text(
-            f"✅ Paper saved for "
-            f"*{PLANS[plan_name]['name']}* plan!\n\n"
-            "It will be broadcast automatically at "
-            "12:40 PM.",
+            f"✅ *{NEWSPAPERS[newspaper_code]}* saved successfully.\n\n"
+            "📡 It will be delivered automatically at the "
+            "scheduled broadcast time to all active subscribers.",
             parse_mode="Markdown",
         )
 
@@ -246,21 +265,63 @@ async def cancel_upload(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
-    """Cancel the PDF upload conversation."""
+    """Cancel PDF upload."""
 
     context.user_data.pop("pending_file_id", None)
 
     if update.message:
         await update.message.reply_text(
-            "❌ Upload cancelled."
+            "❌ Newspaper upload cancelled."
         )
 
     return ConversationHandler.END
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Admin commands
+# Single subscription activation
 # ─────────────────────────────────────────────────────────────────────
+
+async def activate_all_newspapers(user_id: int) -> None:
+    """
+    Activate the ONE All Newspapers subscription.
+
+    Existing db.py stores subscriptions using the three newspaper keys,
+    so we activate all three for the same user.
+    """
+    for newspaper_code in NEWSPAPERS:
+        await db.add_user(user_id, newspaper_code)
+
+
+async def notify_approved_user(
+    bot,
+    user_id: int,
+) -> None:
+    """Tell the subscriber that their subscription is active."""
+
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🎉 *SUBSCRIPTION ACTIVATED!*\n\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "📚 *ALL NEWSPAPERS*\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "📰 The Hindu\n"
+                "📰 Times of India\n"
+                "📰 Indian Express\n\n"
+                f"⏳ Valid for *{SUBSCRIPTION_DAYS} days*\n\n"
+                "Your newspapers will be delivered automatically. "
+                "Enjoy your reading! ☕🗞️"
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning(
+            "Could not notify approved user %s: %s",
+            user_id,
+            e,
+        )
+
 
 @admin_only
 async def approve_command(
@@ -268,16 +329,16 @@ async def approve_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """
-    /approve <user_id> <plan>
+    /approve <user_id>
 
-    Activate a subscription for 30 days.
+    Approve the ONE All Newspapers subscription.
     """
 
-    if len(context.args) < 2:
+    if len(context.args) < 1:
         await update.message.reply_text(
-            "Usage:\n"
-            "`/approve <user_id> <plan>`\n\n"
-            f"Plans: {', '.join(PLANS.keys())}",
+            "❌ *Missing user ID*\n\n"
+            "Use:\n"
+            "`/approve 123456789`",
             parse_mode="Markdown",
         )
         return
@@ -286,55 +347,122 @@ async def approve_command(
         target_user_id = int(context.args[0])
     except ValueError:
         await update.message.reply_text(
-            "❌ user_id must be a number."
+            "❌ User ID must be a number."
         )
         return
 
-    plan = context.args[1].lower()
+    try:
+        await activate_all_newspapers(target_user_id)
+    except Exception as e:
+        logger.exception(
+            "Failed to approve user %s: %s",
+            target_user_id,
+            e,
+        )
 
-    if plan not in PLANS:
         await update.message.reply_text(
-            f"❌ Unknown plan `{plan}`.\n"
-            f"Valid plans: {', '.join(PLANS.keys())}",
-            parse_mode="Markdown",
+            "❌ Approval failed. Please check the logs/database."
         )
         return
-
-    await db.add_user(
-        target_user_id,
-        plan,
-    )
 
     await update.message.reply_text(
-        f"✅ User `{target_user_id}` approved for "
-        f"*{PLANS[plan]['name']}* (30 days).",
+        "✅ *PAYMENT VERIFIED*\n\n"
+        f"👤 User ID: `{target_user_id}`\n"
+        "📚 Plan: *All Newspapers*\n"
+        f"💰 Price: *{SUBSCRIPTION_PRICE}*\n"
+        f"⏳ Duration: *{SUBSCRIPTION_DAYS} days*",
         parse_mode="Markdown",
     )
 
-    # Notify user
+    await notify_approved_user(
+        context.bot,
+        target_user_id,
+    )
+
+
+async def approve_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Admin presses the inline APPROVE button."""
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    if not query.from_user or query.from_user.id != ADMIN_ID:
+        await query.answer(
+            "⛔ You are not authorized.",
+            show_alert=True,
+        )
+        return
+
+    data = query.data or ""
+
+    if not data.startswith("approve:"):
+        return
+
     try:
-        await context.bot.send_message(
-            chat_id=target_user_id,
+        target_user_id = int(
+            data.split(":", 1)[1]
+        )
+    except ValueError:
+        await query.answer(
+            "Invalid user ID.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer("Approving user...")
+
+    try:
+        await activate_all_newspapers(target_user_id)
+    except Exception as e:
+        logger.exception(
+            "Callback approval failed for user %s: %s",
+            target_user_id,
+            e,
+        )
+
+        await query.answer(
+            "Approval failed. Check logs.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        await query.edit_message_text(
             text=(
-                f"🎉 Your *{PLANS[plan]['name']}* "
-                "subscription is now active for 30 days!"
+                "✅ *PAYMENT VERIFIED*\n\n"
+                f"👤 User ID: `{target_user_id}`\n"
+                "📚 *All Newspapers*\n"
+                f"⏳ {SUBSCRIPTION_DAYS} days activated."
             ),
             parse_mode="Markdown",
         )
-
-    except Exception as e:
+    except Exception:
         logger.warning(
-            f"Could not notify user "
-            f"{target_user_id}: {e}"
+            "Could not edit payment claim message for %s.",
+            target_user_id,
         )
 
+    await notify_approved_user(
+        context.bot,
+        target_user_id,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Admin debug
+# ─────────────────────────────────────────────────────────────────────
 
 @admin_only
 async def debug_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Show files available on the Hugging Face Space."""
+    """Show basic Hugging Face filesystem information."""
 
     base_dir = ASSETS_DIR.parent
 
@@ -346,306 +474,425 @@ async def debug_command(
         root_files = f"Error: {e}"
 
     if ASSETS_DIR.exists():
-
         try:
             assets_files = "\n".join(
                 os.listdir(ASSETS_DIR)
             )
         except Exception as e:
             assets_files = f"Error: {e}"
-
     else:
         assets_files = "⚠️ FOLDER DOES NOT EXIST"
 
-    msg = (
-        "📁 *Root Directory:*\n"
-        f"`{root_files}`\n\n"
-        "🖼️ *Assets Directory:*\n"
-        f"`{assets_files}`"
-    )
-
     await update.message.reply_text(
-        msg,
+        "📁 *Root Directory*\n"
+        f"`{root_files}`\n\n"
+        "🖼️ *Assets Directory*\n"
+        f"`{assets_files}`",
         parse_mode="Markdown",
     )
 
 
 # ─────────────────────────────────────────────────────────────────────
-# User commands
+# Customer interface
 # ─────────────────────────────────────────────────────────────────────
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Main customer menu."""
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📰 Subscribe — ₹29/month",
+                    callback_data="buy",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "💳 I've Paid",
+                    callback_data="paid",
+                ),
+                InlineKeyboardButton(
+                    "📋 My Subscription",
+                    callback_data="myplan",
+                ),
+            ],
+        ]
+    )
+
+
+def payment_keyboard() -> InlineKeyboardMarkup:
+    """Payment screen buttons."""
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ I've Paid",
+                    callback_data="paid",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📋 My Subscription",
+                    callback_data="myplan",
+                )
+            ],
+        ]
+    )
+
 
 async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Welcome message."""
+    """Beautiful customer welcome screen."""
 
     user = update.effective_user
 
-    if not user:
+    if not user or not update.message:
         return
 
     await update.message.reply_text(
-        f"👋 Welcome, {user.first_name}!\n\n"
-        "I deliver daily newspaper PDFs "
-        "straight to your Telegram.\n\n"
-
-        "📋 *Available Plans:*\n"
-        "  📰 *The Hindu* — ₹29/month → /buyhindu\n"
-        "  📰 *Times of India* — ₹29/month → /buytoi\n"
-        "  📰 *Indian Express* — ₹29/month → /buyie\n\n"
-
-        "After purchasing, use:\n"
-        "/paidhindu\n"
-        "/paidtoi\n"
-        "/paidie\n\n"
-
-        "Check your subscription with /myplan.",
+        f"👋 *Welcome, {user.first_name}!*\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🗞️ *DAILY NEWSPAPER CLUB*\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Get your daily newspapers delivered "
+        "straight to Telegram.\n\n"
+        "📚 *ONE SUBSCRIPTION • EVERYTHING INCLUDED*\n\n"
+        "📰 The Hindu\n"
+        "📰 Times of India\n"
+        "📰 Indian Express\n\n"
+        f"💰 *Only {SUBSCRIPTION_PRICE}*\n"
+        f"⏳ *{SUBSCRIPTION_DAYS} days*\n\n"
+        "No separate newspaper plans.\n"
+        "Subscribe once and receive all available papers. "
+        "☕📖",
         parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(),
     )
 
 
-async def buy_hindu_command(
+async def buy_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Show The Hindu plan and QR code."""
+    """Show payment QR for the single subscription."""
 
     qr_path = ASSETS_DIR / "qr.png"
 
-    text = (
-        "📰 The Hindu — ₹29/month\n\n"
-        "Scan the QR code below to pay via UPI.\n"
-        "After payment, click /paidhindu "
-        "to notify us!"
+    caption = (
+        "💳 *ALL NEWSPAPERS SUBSCRIPTION*\n\n"
+        "📰 The Hindu\n"
+        "📰 Times of India\n"
+        "📰 Indian Express\n\n"
+        f"💰 *{SUBSCRIPTION_PRICE}*\n"
+        f"⏳ *{SUBSCRIPTION_DAYS} days*\n\n"
+        "Scan the QR code below and complete the UPI payment.\n\n"
+        "After payment, press *I've Paid* below.\n"
+        "The admin will verify your payment and activate "
+        "your subscription."
     )
 
-    if qr_path.exists():
-
-        try:
-            await update.message.reply_photo(
-                photo=qr_path,
-                caption=text,
-            )
-
-        except Exception as e:
-            await update.message.reply_text(
-                f"⚠️ Image error: {e}"
-            )
-
-    else:
-        await update.message.reply_text(
-            "⚠️ QR code not found in assets folder."
-        )
-
-
-async def buy_toi_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """Show Times of India plan and QR code."""
-
-    qr_path = ASSETS_DIR / "qr.png"
-
-    text = (
-        "📰 Times of India — ₹29/month\n\n"
-        "Scan the QR code below to pay via UPI.\n"
-        "After payment, click /paidtoi "
-        "to notify us!"
-    )
-
-    if qr_path.exists():
-
-        try:
-            await update.message.reply_photo(
-                photo=qr_path,
-                caption=text,
-            )
-
-        except Exception as e:
-            await update.message.reply_text(
-                f"⚠️ Image error: {e}"
-            )
-
-    else:
-        await update.message.reply_text(
-            "⚠️ QR code not found in assets folder."
-        )
-
-
-async def buy_ie_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """Show Indian Express plan and QR code."""
-
-    qr_path = ASSETS_DIR / "qr.png"
-
-    text = (
-        "📰 Indian Express — ₹29/month\n\n"
-        "Scan the QR code below to pay via UPI.\n"
-        "After payment, click /paidie "
-        "to notify us!"
-    )
-
-    if qr_path.exists():
-
-        try:
-            await update.message.reply_photo(
-                photo=qr_path,
-                caption=text,
-            )
-
-        except Exception as e:
-            await update.message.reply_text(
-                f"⚠️ Image error: {e}"
-            )
-
-    else:
-        await update.message.reply_text(
-            "⚠️ QR code not found in assets folder."
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Payment notifications
-# ─────────────────────────────────────────────────────────────────────
-
-async def notify_admin_payment(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    plan: str,
-) -> None:
-    """Notify admin that a user claims to have paid."""
-
-    user = update.effective_user
-
-    if not user:
+    if not update.message:
         return
+
+    if qr_path.exists():
+        try:
+            await update.message.reply_photo(
+                photo=qr_path,
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=payment_keyboard(),
+            )
+        except Exception as e:
+            logger.exception(
+                "Could not send QR image: %s",
+                e,
+            )
+
+            await update.message.reply_text(
+                caption,
+                parse_mode="Markdown",
+                reply_markup=payment_keyboard(),
+            )
+    else:
+        await update.message.reply_text(
+            "⚠️ *Payment QR is currently unavailable.*\n\n"
+            "Please contact the admin.",
+            parse_mode="Markdown",
+        )
+
+
+async def create_payment_claim(
+    bot,
+    user,
+) -> bool:
+    """Send a payment claim to the admin."""
 
     user_id = user.id
-    username = user.username or user.first_name
+    display_name = user.full_name or "Unknown"
+    username = (
+        f"@{user.username}"
+        if user.username
+        else "No username"
+    )
 
-    await context.bot.send_message(
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ APPROVE USER",
+                    callback_data=f"approve:{user_id}",
+                )
+            ]
+        ]
+    )
+
+    await bot.send_message(
         chat_id=ADMIN_ID,
         text=(
-            "💰 *Payment Claim*\n\n"
-            f"User: @{username} (`{user_id}`)\n"
-            f"Plan: *{PLANS[plan]['name']}*\n\n"
-            "Verify your bank and run:\n"
-            f"`/approve {user_id} {plan}`"
+            "💰 *NEW PAYMENT CLAIM*\n\n"
+            f"👤 *Name:* {display_name}\n"
+            f"🔗 *Username:* {username}\n"
+            f"🆔 *User ID:* `{user_id}`\n\n"
+            "📚 *Plan:* All Newspapers\n"
+            f"💵 *Amount:* {SUBSCRIPTION_PRICE}\n\n"
+            "Verify the payment in your UPI/bank app, "
+            "then press *APPROVE USER*."
         ),
         parse_mode="Markdown",
+        reply_markup=keyboard,
     )
 
-    await update.message.reply_text(
-        "✅ Payment notification sent to admin!\n\n"
-        "You'll be activated once the admin "
-        "verifies the payment."
-    )
+    return True
 
 
-async def paid_hindu_command(
+async def paid_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """/paidhindu — Hindu payment notification."""
+    """User says they completed payment."""
 
-    await notify_admin_payment(
-        update,
-        context,
-        "hindu",
-    )
+    user = update.effective_user
 
+    if not user or not update.message:
+        return
 
-async def paid_toi_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """/paidtoi — TOI payment notification."""
+    try:
+        await create_payment_claim(
+            context.bot,
+            user,
+        )
 
-    await notify_admin_payment(
-        update,
-        context,
-        "toi",
-    )
+        await update.message.reply_text(
+            "✅ *Payment claim sent!*\n\n"
+            "Your payment will be verified by the admin.\n"
+            "Once approved, your *All Newspapers* subscription "
+            "will be active for 30 days.",
+            parse_mode="Markdown",
+        )
 
+    except Exception as e:
+        logger.exception(
+            "Could not send payment claim from %s: %s",
+            user.id,
+            e,
+        )
 
-async def paid_ie_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """/paidie — Indian Express payment notification."""
+        await update.message.reply_text(
+            "⚠️ We couldn't send your payment claim right now.\n"
+            "Please try again in a moment."
+        )
 
-    await notify_admin_payment(
-        update,
-        context,
-        "ie",
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Subscription status
-# ─────────────────────────────────────────────────────────────────────
 
 async def myplan_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Check subscription status."""
+    """Show one combined subscription instead of three plans."""
 
-    user_id = update.effective_user.id
+    user = update.effective_user
 
-    user_plans = await db.get_user_plans(user_id)
-
-    if not user_plans:
-        await update.message.reply_text(
-            "❌ You don't have any active subscriptions.\n\n"
-            "Use /start to see available plans!"
-        )
+    if not user:
         return
 
-    response_lines = [
-        "📋 *Your Subscriptions*\n"
-    ]
+    user_plans = await db.get_user_plans(user.id)
 
-    for plan_data in user_plans:
+    valid_expiries = []
 
-        expiry = plan_data["expiry_date"]
+    for plan_data in user_plans or []:
+        expiry = plan_data.get("expiry_date")
 
+        if isinstance(expiry, datetime):
+            expiry = expiry.date()
+
+        if isinstance(expiry, date):
+            valid_expiries.append(expiry)
+
+    if not valid_expiries:
+        text = (
+            "📋 *YOUR SUBSCRIPTION*\n\n"
+            "🔴 *No active subscription*\n\n"
+            "Get all available newspapers for "
+            f"*{SUBSCRIPTION_PRICE}*.\n\n"
+            "📰 The Hindu\n"
+            "📰 Times of India\n"
+            "📰 Indian Express"
+        )
+    else:
+        expiry = max(valid_expiries)
         days_left = (
             expiry - date.today()
         ).days
 
-        plan_info = PLANS.get(
-            plan_data["plan"],
-            {},
-        )
-
-        plan_display = plan_info.get(
-            "name",
-            plan_data["plan"],
-        )
-
         if days_left < 0:
-
-            response_lines.append(
-                f"❌ *{plan_display}*: "
-                f"Expired on {expiry}"
+            text = (
+                "📋 *YOUR SUBSCRIPTION*\n\n"
+                "🔴 *ALL NEWSPAPERS — EXPIRED*\n\n"
+                f"Expired: `{expiry}`\n\n"
+                f"Renew for *{SUBSCRIPTION_PRICE}*."
             )
-
         else:
-
-            response_lines.append(
-                f"✅ *{plan_display}*: "
-                f"*{days_left}* days left "
-                f"(Expires: {expiry})"
+            text = (
+                "📋 *YOUR SUBSCRIPTION*\n\n"
+                "🟢 *ALL NEWSPAPERS — ACTIVE*\n\n"
+                "📰 The Hindu\n"
+                "📰 Times of India\n"
+                "📰 Indian Express\n\n"
+                f"⏳ *{days_left} days remaining*\n"
+                f"📅 Expires: `{expiry}`\n\n"
+                "Your papers will arrive automatically. "
+                "☕🗞️"
             )
 
-    await update.message.reply_text(
-        "\n".join(response_lines),
-        parse_mode="Markdown",
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📰 Subscribe / Renew",
+                    callback_data="buy",
+                )
+            ]
+        ]
     )
+
+    if update.callback_query and update.callback_query.message:
+        await update.callback_query.message.reply_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+    elif update.message:
+        await update.message.reply_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Callback router for customer buttons
+# ─────────────────────────────────────────────────────────────────────
+
+async def customer_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Handle customer inline buttons."""
+
+    query = update.callback_query
+
+    if not query:
+        return
+
+    data = query.data or ""
+
+    if data == "buy":
+        await query.answer()
+
+        # Callback messages cannot use update.message.
+        qr_path = ASSETS_DIR / "qr.png"
+
+        caption = (
+            "💳 *ALL NEWSPAPERS SUBSCRIPTION*\n\n"
+            "📰 The Hindu\n"
+            "📰 Times of India\n"
+            "📰 Indian Express\n\n"
+            f"💰 *{SUBSCRIPTION_PRICE}*\n"
+            f"⏳ *{SUBSCRIPTION_DAYS} days*\n\n"
+            "Scan the QR code and complete your UPI payment.\n"
+            "Then press *I've Paid*."
+        )
+
+        if query.message:
+            if qr_path.exists():
+                try:
+                    await query.message.reply_photo(
+                        photo=qr_path,
+                        caption=caption,
+                        parse_mode="Markdown",
+                        reply_markup=payment_keyboard(),
+                    )
+                except Exception as e:
+                    logger.exception(
+                        "Could not send callback QR: %s",
+                        e,
+                    )
+                    await query.message.reply_text(
+                        caption,
+                        parse_mode="Markdown",
+                        reply_markup=payment_keyboard(),
+                    )
+            else:
+                await query.message.reply_text(
+                    "⚠️ Payment QR is currently unavailable."
+                )
+
+        return
+
+    if data == "paid":
+        await query.answer()
+
+        user = query.from_user
+
+        if not user or not query.message:
+            return
+
+        try:
+            await create_payment_claim(
+                context.bot,
+                user,
+            )
+
+            await query.message.reply_text(
+                "✅ *Payment claim sent!*\n\n"
+                "The admin will verify your payment and activate "
+                "your subscription after approval.",
+                parse_mode="Markdown",
+            )
+
+        except Exception as e:
+            logger.exception(
+                "Callback payment claim failed for %s: %s",
+                user.id,
+                e,
+            )
+
+            await query.message.reply_text(
+                "⚠️ We couldn't send your payment claim. "
+                "Please try again."
+            )
+
+        return
+
+    if data == "myplan":
+        await query.answer()
+        await myplan_command(
+            update,
+            context,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -654,43 +901,48 @@ async def myplan_command(
 
 async def broadcast_paper(
     bot,
-    plan_name: str,
+    newspaper_code: str,
     file_id: str,
 ) -> int:
-    """Send a paper to all active users of a plan."""
+    """
+    Send one newspaper to all subscribers who have the corresponding
+    internal newspaper entry active.
+
+    Because approval activates all three internal entries, every active
+    All Newspapers subscriber receives every newspaper.
+    """
 
     active_users = await db.get_active_users(
-        plan=plan_name
+        plan=newspaper_code
     )
 
-    plan_display = PLANS.get(
-        plan_name,
-        {},
-    ).get(
-        "name",
-        plan_name,
+    newspaper_name = NEWSPAPERS.get(
+        newspaper_code,
+        newspaper_code,
     )
 
     success_count = 0
 
     for user in active_users:
-
         try:
-
             await bot.send_document(
                 chat_id=user["user_id"],
                 document=file_id,
-                caption=f"📰 Today's *{plan_display}*",
+                caption=(
+                    f"📰 *{newspaper_name}*\n"
+                    "📚 Daily Newspaper Club"
+                ),
                 parse_mode="Markdown",
             )
 
             success_count += 1
 
         except Exception as e:
-
             logger.error(
-                f"Failed to send to "
-                f"{user['user_id']}: {e}"
+                "Failed to send %s to user %s: %s",
+                newspaper_name,
+                user["user_id"],
+                e,
             )
 
     return success_count
@@ -703,10 +955,7 @@ async def broadcast_paper(
 async def send_pdfs_job(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """
-    Daily 12:40 PM IST.
-    Send today's papers to subscribers.
-    """
+    """Daily scheduled newspaper broadcast."""
 
     logger.info(
         "Running daily PDF broadcast job..."
@@ -715,28 +964,25 @@ async def send_pdfs_job(
     papers = await db.get_todays_papers()
 
     if not papers:
-
         logger.info(
-            "No papers uploaded for today. "
-            "Skipping broadcast."
+            "No papers uploaded for today. Skipping broadcast."
         )
-
         return
 
     for paper in papers:
-
-        plan_name = paper["plan_name"]
+        newspaper_code = paper["plan_name"]
         file_id = paper["file_id"]
 
         count = await broadcast_paper(
             context.bot,
-            plan_name,
+            newspaper_code,
             file_id,
         )
 
         logger.info(
-            f"Broadcast '{plan_name}' "
-            f"to {count} user(s)."
+            "Broadcast '%s' to %s subscriber(s).",
+            newspaper_code,
+            count,
         )
 
     logger.info(
@@ -747,20 +993,17 @@ async def send_pdfs_job(
 async def cleanup_users_job(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """
-    Daily 2:00 AM IST.
-    Remove expired subscriptions.
-    """
+    """Remove expired subscription rows."""
 
     logger.info(
-        "Running expired users cleanup job..."
+        "Running expired subscription cleanup..."
     )
 
     deleted = await db.delete_expired_users()
 
     logger.info(
-        f"Cleanup complete. "
-        f"Removed {deleted} expired user(s)."
+        "Cleanup complete. Removed %s expired row(s).",
+        deleted,
     )
 
 
@@ -769,7 +1012,7 @@ async def cleanup_users_job(
 # ─────────────────────────────────────────────────────────────────────
 
 async def post_init(application) -> None:
-    """Initialize database after Telegram application starts."""
+    """Initialize database."""
 
     await db.init_db()
 
@@ -779,7 +1022,7 @@ async def post_init(application) -> None:
 
 
 async def post_shutdown(application) -> None:
-    """Close database when Telegram application shuts down."""
+    """Close database."""
 
     await db.close_db()
 
@@ -797,11 +1040,7 @@ app_api = FastAPI()
 
 @app_api.get("/")
 def health_check():
-    """Health endpoint for Hugging Face."""
-
-    logger.info(
-        "Hugging Face health check received."
-    )
+    """Hugging Face health endpoint."""
 
     return {
         "status": "ok",
@@ -810,7 +1049,7 @@ def health_check():
 
 
 def run_dummy_server():
-    """Run FastAPI on Hugging Face's required port."""
+    """Run FastAPI health server on port 7860."""
 
     uvicorn.run(
         app_api,
@@ -821,35 +1060,44 @@ def run_dummy_server():
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Main
+# Telegram application
 # ─────────────────────────────────────────────────────────────────────
 
 def build_application():
-    """Build Telegram application with optional proxy support."""
+    """Build Telegram application through the Vercel proxy."""
 
     if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN is not set in environment variables.")
+        raise ValueError(
+            "BOT_TOKEN is not set in environment variables."
+        )
 
     if not ADMIN_ID:
-        raise ValueError("ADMIN_ID is not set in environment variables.")
-
-    builder = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-    )
+        raise ValueError(
+            "ADMIN_ID is not set in environment variables."
+        )
 
     if not PROXY_URL:
-        logger.info(
-            "🌐 PROXY_URL is not set. Using direct Telegram connection."
+        raise ValueError(
+            "PROXY_URL is not set. "
+            "Please add PROXY_URL to Hugging Face Secrets."
         )
-        return builder.build()
 
-    logger.info("🌐 PROXY_URL detected. Using configured Telegram proxy.")
+    if not PROXY_SECRET:
+        raise ValueError(
+            "PROXY_SECRET is not set. "
+            "Please add PROXY_SECRET to Hugging Face Secrets."
+        )
+
+    logger.info(
+        "🌐 Using Vercel Telegram proxy."
+    )
+
+    proxy_base = (
+        f"{PROXY_URL.rstrip('/')}"
+        f"/api/telegram/{PROXY_SECRET}/bot"
+    )
 
     request = HTTPXRequest(
-        proxy=PROXY_URL,
         connect_timeout=60.0,
         read_timeout=60.0,
         write_timeout=60.0,
@@ -857,7 +1105,6 @@ def build_application():
     )
 
     get_updates_request = HTTPXRequest(
-        proxy=PROXY_URL,
         connect_timeout=60.0,
         read_timeout=60.0,
         write_timeout=60.0,
@@ -865,15 +1112,23 @@ def build_application():
     )
 
     return (
-        builder
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .base_url(proxy_base)
         .request(request)
         .get_updates_request(get_updates_request)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Handler registration
+# ─────────────────────────────────────────────────────────────────────
+
 def register_handlers(application):
-    """Register all Telegram handlers and scheduled jobs."""
+    """Register all handlers before polling."""
 
     pdf_upload_handler = ConversationHandler(
         entry_points=[
@@ -883,35 +1138,132 @@ def register_handlers(application):
             )
         ],
         states={
-            AWAITING_PLAN_NAME: [
+            AWAITING_NEWSPAPER_NAME: [
                 MessageHandler(
                     filters.TEXT
                     & ~filters.COMMAND
                     & filters.User(ADMIN_ID),
-                    handle_plan_name_reply,
+                    handle_newspaper_name_reply,
                 )
-            ],
+            ]
         },
-        fallbacks=[CommandHandler("cancel", cancel_upload)],
+        fallbacks=[
+            CommandHandler(
+                "cancel",
+                cancel_upload,
+            )
+        ],
     )
 
-    application.add_handler(pdf_upload_handler)
+    application.add_handler(
+        pdf_upload_handler
+    )
 
-    application.add_handler(CommandHandler("approve", approve_command))
-    application.add_handler(CommandHandler("debug", debug_command))
+    # Admin commands.
+    application.add_handler(
+        CommandHandler(
+            "approve",
+            approve_command,
+        )
+    )
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("buyhindu", buy_hindu_command))
-    application.add_handler(CommandHandler("buytoi", buy_toi_command))
-    application.add_handler(CommandHandler("buyie", buy_ie_command))
+    application.add_handler(
+        CommandHandler(
+            "debug",
+            debug_command,
+        )
+    )
 
-    application.add_handler(CommandHandler("paidhindu", paid_hindu_command))
-    application.add_handler(CommandHandler("paidtoi", paid_toi_command))
-    application.add_handler(CommandHandler("paidie", paid_ie_command))
+    # Customer commands.
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command,
+        )
+    )
 
-    application.add_handler(CommandHandler("myplan", myplan_command))
+    application.add_handler(
+        CommandHandler(
+            "buy",
+            buy_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "paid",
+            paid_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "myplan",
+            myplan_command,
+        )
+    )
+
+    # Compatibility aliases for users who still have the old commands.
+    application.add_handler(
+        CommandHandler(
+            "buyhindu",
+            buy_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "buytoi",
+            buy_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "buyie",
+            buy_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "paidhindu",
+            paid_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "paidtoi",
+            paid_command,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "paidie",
+            paid_command,
+        )
+    )
+
+    # Admin approval button MUST be registered before general customer
+    # callbacks.
+    application.add_handler(
+        CallbackQueryHandler(
+            approve_callback,
+            pattern=r"^approve:\d+$",
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            customer_callback,
+            pattern=r"^(buy|paid|myplan)$",
+        )
+    )
 
     job_queue = application.job_queue
+
     if job_queue is None:
         raise RuntimeError(
             "JobQueue is not available. "
@@ -930,34 +1282,51 @@ def register_handlers(application):
         name="daily_cleanup",
     )
 
-    logger.info("All handlers and scheduled jobs registered.")
+    logger.info(
+        "All handlers and scheduled jobs registered."
+    )
 
+
+# ─────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    """Build and run the Telegram bot."""
+    """Start the Telegram bot."""
 
     if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN is not set in environment variables.")
+        raise ValueError(
+            "BOT_TOKEN is not set in environment variables."
+        )
 
     if not ADMIN_ID:
-        raise ValueError("ADMIN_ID is not set in environment variables.")
+        raise ValueError(
+            "ADMIN_ID is not set in environment variables."
+        )
 
     threading.Thread(
         target=run_dummy_server,
         daemon=True,
     ).start()
 
-    logger.info("Started FastAPI health server on port 7860.")
-    logger.info("Building Telegram application...")
+    logger.info(
+        "Started FastAPI health server on port 7860."
+    )
+
+    logger.info(
+        "Building Telegram application..."
+    )
 
     application = build_application()
 
-    # IMPORTANT: register everything before polling.
+    # Register EVERYTHING before polling.
     register_handlers(application)
 
-    logger.info("🚀 Telegram bot is starting polling...")
+    logger.info(
+        "🚀 Telegram bot is starting polling..."
+    )
 
-    # This is intentionally called exactly once.
+    # Exactly one polling call.
     application.run_polling(
         drop_pending_updates=True
     )
