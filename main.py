@@ -100,15 +100,6 @@ NEWSPAPERS = {
     "ie": "Indian Express",
 }
 
-# Compatibility structure for existing DB/paper records.
-PLANS = {
-    code: {
-        "name": name,
-        "price": SUBSCRIPTION_PRICE,
-    }
-    for code, name in NEWSPAPERS.items()
-}
-
 
 # ─────────────────────────────────────────────────────────────────────
 # Logging
@@ -139,6 +130,10 @@ def admin_only(func):
         user = update.effective_user
 
         if not user or user.id != ADMIN_ID:
+            logger.warning(
+                "Unauthorized access attempt from user_id=%s",
+                user.id if user else "None",
+            )
             return
 
         return await func(update, context)
@@ -159,6 +154,7 @@ async def handle_pdf_received(
     user = update.effective_user
 
     if not user or user.id != ADMIN_ID:
+        logger.warning("Unauthorized PDF upload attempt")
         return ConversationHandler.END
 
     if not update.message or not update.message.document:
@@ -167,9 +163,12 @@ async def handle_pdf_received(
     document: Document = update.message.document
 
     if document.mime_type != "application/pdf":
-        await update.message.reply_text(
-            "⚠️ Please send a PDF file."
-        )
+        try:
+            await update.message.reply_text(
+                "⚠️ Please send a PDF file."
+            )
+        except Exception as e:
+            logger.exception("Failed to send error message: %s", e)
         return ConversationHandler.END
 
     context.user_data["pending_file_id"] = document.file_id
@@ -179,13 +178,17 @@ async def handle_pdf_received(
         for code, name in NEWSPAPERS.items()
     )
 
-    await update.message.reply_text(
-        "📄 *NEWSPAPER RECEIVED*\n\n"
-        "Which newspaper is this PDF for?\n\n"
-        f"{newspaper_list}\n\n"
-        "Reply with the code, for example `hindu`.",
-        parse_mode="Markdown",
-    )
+    try:
+        await update.message.reply_text(
+            "📄 *NEWSPAPER RECEIVED*\n\n"
+            "Which newspaper is this PDF for?\n\n"
+            f"{newspaper_list}\n\n"
+            "Reply with the code, for example `hindu`.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.exception("Failed to send newspaper selection prompt: %s", e)
+        return ConversationHandler.END
 
     return AWAITING_NEWSPAPER_NAME
 
@@ -199,6 +202,7 @@ async def handle_newspaper_name_reply(
     user = update.effective_user
 
     if not user or user.id != ADMIN_ID:
+        logger.warning("Unauthorized newspaper name reply")
         return ConversationHandler.END
 
     if not update.message or not update.message.text:
@@ -208,55 +212,121 @@ async def handle_newspaper_name_reply(
     file_id = context.user_data.get("pending_file_id")
 
     if newspaper_code not in NEWSPAPERS:
-        await update.message.reply_text(
-            "❌ Unknown newspaper code.\n\n"
-            "Use one of:\n"
-            "• `hindu`\n"
-            "• `toi`\n"
-            "• `ie`",
-            parse_mode="Markdown",
-        )
+        try:
+            await update.message.reply_text(
+                "❌ Unknown newspaper code.\n\n"
+                "Use one of:\n"
+                "• `hindu`\n"
+                "• `toi`\n"
+                "• `ie`",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.exception("Failed to send invalid code message: %s", e)
         return AWAITING_NEWSPAPER_NAME
 
     if not file_id:
-        await update.message.reply_text(
-            "❌ No pending PDF found. Please send the PDF again."
-        )
+        try:
+            await update.message.reply_text(
+                "❌ No pending PDF found. Please send the PDF again."
+            )
+        except Exception as e:
+            logger.exception("Failed to send no PDF message: %s", e)
         return ConversationHandler.END
 
-    await db.add_paper(newspaper_code, file_id)
+    # 🔴 FIXED: Added try-except for database operation
+    try:
+        await db.add_paper(newspaper_code, file_id)
+    except Exception as e:
+        logger.exception(
+            "Failed to save newspaper PDF for %s: %s",
+            newspaper_code,
+            e,
+        )
+        try:
+            await update.message.reply_text(
+                "❌ Failed to save newspaper to database. "
+                "Please try again."
+            )
+        except Exception as send_err:
+            logger.exception("Failed to send error message: %s", send_err)
+        return ConversationHandler.END
 
     context.user_data.pop("pending_file_id", None)
 
-    now_ist = datetime.now(IST).time()
-
     # IMPORTANT:
-    # The scheduled job is only a fallback. If the admin uploads the
-    # newspaper after the scheduled time, distribute it immediately.
-    if now_ist >= IST_BROADCAST_TIME:
-        await update.message.reply_text(
-            "⏰ The scheduled broadcast time has passed.\n\n"
-            "📡 Sending this newspaper to all active subscribers now..."
-        )
+    # If the newspaper is uploaded after 7:30 AM IST,
+    # distribute it immediately.
+    now_ist = datetime.now(IST)
 
-        count = await broadcast_paper(
-            context.bot,
-            newspaper_code,
-            file_id,
-        )
+    scheduled_today = now_ist.replace(
+        hour=IST_BROADCAST_TIME.hour,
+        minute=IST_BROADCAST_TIME.minute,
+        second=0,
+        microsecond=0,
+    )
 
-        await update.message.reply_text(
-            f"✅ *{NEWSPAPERS[newspaper_code]}* saved.\n\n"
-            f"📤 Sent to *{count}* active subscriber(s).",
-            parse_mode="Markdown",
-        )
+    if now_ist >= scheduled_today:
+        try:
+            await update.message.reply_text(
+                "⏰ The scheduled broadcast time has passed.\n\n"
+                "📡 Sending this newspaper to all active subscribers now..."
+            )
+        except Exception as e:
+            logger.exception(
+                "Failed to send broadcast notice: %s",
+                e,
+            )
+
+        try:
+            count = await broadcast_paper(
+                context.bot,
+                newspaper_code,
+                file_id,
+            )
+
+            try:
+                await update.message.reply_text(
+                    f"✅ *{NEWSPAPERS[newspaper_code]}* saved.\n\n"
+                    f"📤 Sent to *{count}* active subscriber(s).",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.exception(
+                    "Failed to send success message: %s",
+                    e,
+                )
+
+        except Exception as e:
+            logger.exception(
+                "Failed to broadcast newspaper: %s",
+                e,
+            )
+
+            try:
+                await update.message.reply_text(
+                    "⚠️ Saved but failed to broadcast. "
+                    "Check logs for details."
+                )
+            except Exception as send_err:
+                logger.exception(
+                    "Failed to send error notification: %s",
+                    send_err,
+                )
+
     else:
-        await update.message.reply_text(
-            f"✅ *{NEWSPAPERS[newspaper_code]}* saved successfully.\n\n"
-            "📡 It will be delivered automatically at the "
-            "scheduled broadcast time to all active subscribers.",
-            parse_mode="Markdown",
-        )
+        try:
+            await update.message.reply_text(
+                f"✅ *{NEWSPAPERS[newspaper_code]}* saved successfully.\n\n"
+                "📡 It will be delivered automatically at the "
+                "scheduled broadcast time to all active subscribers.",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.exception(
+                "Failed to send save confirmation: %s",
+                e,
+            )
 
     return ConversationHandler.END
 
@@ -265,14 +335,20 @@ async def cancel_upload(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> int:
-    """Cancel PDF upload."""
+    """Cancel the current newspaper PDF upload conversation."""
 
     context.user_data.pop("pending_file_id", None)
 
     if update.message:
-        await update.message.reply_text(
-            "❌ Newspaper upload cancelled."
-        )
+        try:
+            await update.message.reply_text(
+                "❌ Newspaper upload cancelled."
+            )
+        except Exception as e:
+            logger.exception(
+                "Failed to send cancellation message: %s",
+                e,
+            )
 
     return ConversationHandler.END
 
@@ -281,22 +357,40 @@ async def cancel_upload(
 # Single subscription activation
 # ─────────────────────────────────────────────────────────────────────
 
-async def activate_all_newspapers(user_id: int) -> None:
+# 🔴 FIXED: Now returns bool instead of None
+async def activate_all_newspapers(user_id: int) -> bool:
     """
     Activate the ONE All Newspapers subscription.
 
     Existing db.py stores subscriptions using the three newspaper keys,
     so we activate all three for the same user.
+    
+    Returns True if successful, False otherwise.
     """
-    for newspaper_code in NEWSPAPERS:
-        await db.add_user(user_id, newspaper_code)
+    try:
+        for newspaper_code in NEWSPAPERS:
+            await db.add_user(user_id, newspaper_code)
+        logger.info("Successfully activated newspapers for user %s", user_id)
+        return True
+    except Exception as e:
+        logger.exception(
+            "Failed to activate newspapers for user %s: %s",
+            user_id,
+            e,
+        )
+        return False
 
 
+# 🔴 FIXED: Now returns bool; handles exceptions
 async def notify_approved_user(
     bot,
     user_id: int,
-) -> None:
-    """Tell the subscriber that their subscription is active."""
+) -> bool:
+    """
+    Tell the subscriber that their subscription is active.
+    
+    Returns True if notification sent successfully, False otherwise.
+    """
 
     try:
         await bot.send_message(
@@ -315,12 +409,14 @@ async def notify_approved_user(
             ),
             parse_mode="Markdown",
         )
+        return True
     except Exception as e:
         logger.warning(
             "Could not notify approved user %s: %s",
             user_id,
             e,
         )
+        return False
 
 
 @admin_only
@@ -334,46 +430,59 @@ async def approve_command(
     Approve the ONE All Newspapers subscription.
     """
 
+    # 🔴 FIXED: Added null check for update.message
+    if not update.message:
+        logger.warning("approve_command called with no message")
+        return
+
     if len(context.args) < 1:
-        await update.message.reply_text(
-            "❌ *Missing user ID*\n\n"
-            "Use:\n"
-            "`/approve 123456789`",
-            parse_mode="Markdown",
-        )
+        try:
+            await update.message.reply_text(
+                "❌ *Missing user ID*\n\n"
+                "Use:\n"
+                "`/approve 123456789`",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.exception("Failed to send missing ID message: %s", e)
         return
 
     try:
         target_user_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text(
-            "❌ User ID must be a number."
-        )
+        try:
+            await update.message.reply_text(
+                "❌ User ID must be a number."
+            )
+        except Exception as e:
+            logger.exception("Failed to send invalid ID message: %s", e)
+        return
+
+    # 🔴 FIXED: Check return value of activate_all_newspapers
+    success = await activate_all_newspapers(target_user_id)
+
+    if not success:
+        try:
+            await update.message.reply_text(
+                "❌ Approval failed. Please check the logs/database."
+            )
+        except Exception as e:
+            logger.exception("Failed to send failure message: %s", e)
         return
 
     try:
-        await activate_all_newspapers(target_user_id)
-    except Exception as e:
-        logger.exception(
-            "Failed to approve user %s: %s",
-            target_user_id,
-            e,
-        )
-
         await update.message.reply_text(
-            "❌ Approval failed. Please check the logs/database."
+            "✅ *PAYMENT VERIFIED*\n\n"
+            f"👤 User ID: `{target_user_id}`\n"
+            "📚 Plan: *All Newspapers*\n"
+            f"💰 Price: *{SUBSCRIPTION_PRICE}*\n"
+            f"⏳ Duration: *{SUBSCRIPTION_DAYS} days*",
+            parse_mode="Markdown",
         )
-        return
+    except Exception as e:
+        logger.exception("Failed to send approval confirmation: %s", e)
 
-    await update.message.reply_text(
-        "✅ *PAYMENT VERIFIED*\n\n"
-        f"👤 User ID: `{target_user_id}`\n"
-        "📚 Plan: *All Newspapers*\n"
-        f"💰 Price: *{SUBSCRIPTION_PRICE}*\n"
-        f"⏳ Duration: *{SUBSCRIPTION_DAYS} days*",
-        parse_mode="Markdown",
-    )
-
+    # Notify user
     await notify_approved_user(
         context.bot,
         target_user_id,
@@ -392,10 +501,13 @@ async def approve_callback(
         return
 
     if not query.from_user or query.from_user.id != ADMIN_ID:
-        await query.answer(
-            "⛔ You are not authorized.",
-            show_alert=True,
-        )
+        try:
+            await query.answer(
+                "⛔ You are not authorized.",
+                show_alert=True,
+            )
+        except Exception as e:
+            logger.exception("Failed to send unauthorized answer: %s", e)
         return
 
     data = query.data or ""
@@ -404,31 +516,33 @@ async def approve_callback(
         return
 
     try:
-        target_user_id = int(
-            data.split(":", 1)[1]
-        )
-    except ValueError:
-        await query.answer(
-            "Invalid user ID.",
-            show_alert=True,
-        )
+        target_user_id = int(data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        try:
+            await query.answer(
+                "Invalid user ID.",
+                show_alert=True,
+            )
+        except Exception as e:
+            logger.exception("Failed to send invalid ID answer: %s", e)
         return
 
-    await query.answer("Approving user...")
-
     try:
-        await activate_all_newspapers(target_user_id)
+        await query.answer("Approving user...")
     except Exception as e:
-        logger.exception(
-            "Callback approval failed for user %s: %s",
-            target_user_id,
-            e,
-        )
+        logger.exception("Failed to send processing answer: %s", e)
 
-        await query.answer(
-            "Approval failed. Check logs.",
-            show_alert=True,
-        )
+    # 🔴 FIXED: Check return value
+    success = await activate_all_newspapers(target_user_id)
+
+    if not success:
+        try:
+            await query.answer(
+                "Approval failed. Check logs.",
+                show_alert=True,
+            )
+        except Exception as e:
+            logger.exception("Failed to send failure answer: %s", e)
         return
 
     try:
@@ -441,12 +555,14 @@ async def approve_callback(
             ),
             parse_mode="Markdown",
         )
-    except Exception:
+    except Exception as e:
         logger.warning(
-            "Could not edit payment claim message for %s.",
+            "Could not edit payment claim message for %s: %s",
             target_user_id,
+            e,
         )
 
+    # Notify user
     await notify_approved_user(
         context.bot,
         target_user_id,
@@ -462,34 +578,38 @@ async def debug_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Show basic Hugging Face filesystem information."""
+    """Show basic filesystem information."""
+
+    # 🔴 FIXED: Added null check for update.message
+    if not update.message:
+        logger.warning("debug_command called with no message")
+        return
 
     base_dir = ASSETS_DIR.parent
 
     try:
-        root_files = "\n".join(
-            os.listdir(base_dir)
-        )
+        root_files = "\n".join(os.listdir(base_dir))
     except Exception as e:
         root_files = f"Error: {e}"
 
     if ASSETS_DIR.exists():
         try:
-            assets_files = "\n".join(
-                os.listdir(ASSETS_DIR)
-            )
+            assets_files = "\n".join(os.listdir(ASSETS_DIR))
         except Exception as e:
             assets_files = f"Error: {e}"
     else:
         assets_files = "⚠️ FOLDER DOES NOT EXIST"
 
-    await update.message.reply_text(
-        "📁 *Root Directory*\n"
-        f"`{root_files}`\n\n"
-        "🖼️ *Assets Directory*\n"
-        f"`{assets_files}`",
-        parse_mode="Markdown",
-    )
+    try:
+        await update.message.reply_text(
+            "📁 *Root Directory*\n"
+            f"`{root_files}`\n\n"
+            "🖼️ *Assets Directory*\n"
+            f"`{assets_files}`",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.exception("Failed to send debug info: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -553,25 +673,28 @@ async def start_command(
     if not user or not update.message:
         return
 
-    await update.message.reply_text(
-        f"👋 *Welcome, {user.first_name}!*\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🗞️ *DAILY NEWSPAPER CLUB*\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "Get your daily newspapers delivered "
-        "straight to Telegram.\n\n"
-        "📚 *ONE SUBSCRIPTION • EVERYTHING INCLUDED*\n\n"
-        "📰 The Hindu\n"
-        "📰 Times of India\n"
-        "📰 Indian Express\n\n"
-        f"💰 *Only {SUBSCRIPTION_PRICE}*\n"
-        f"⏳ *{SUBSCRIPTION_DAYS} days*\n\n"
-        "No separate newspaper plans.\n"
-        "Subscribe once and receive all available papers. "
-        "☕📖",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard(),
-    )
+    try:
+        await update.message.reply_text(
+            f"👋 *Welcome, {user.first_name}!*\n\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🗞️ *DAILY NEWSPAPER CLUB*\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "Get your daily newspapers delivered "
+            "straight to Telegram.\n\n"
+            "📚 *ONE SUBSCRIPTION • EVERYTHING INCLUDED*\n\n"
+            "📰 The Hindu\n"
+            "📰 Times of India\n"
+            "📰 Indian Express\n\n"
+            f"💰 *Only {SUBSCRIPTION_PRICE}*\n"
+            f"⏳ *{SUBSCRIPTION_DAYS} days*\n\n"
+            "No separate newspaper plans.\n"
+            "Subscribe once and receive all available papers. "
+            "☕📖",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception as e:
+        logger.exception("Failed to send start message: %s", e)
 
 
 async def buy_command(
@@ -579,6 +702,9 @@ async def buy_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Show payment QR for the single subscription."""
+
+    if not update.message:
+        return
 
     qr_path = ASSETS_DIR / "qr.png"
 
@@ -595,41 +721,45 @@ async def buy_command(
         "your subscription."
     )
 
-    if not update.message:
-        return
-
-    if qr_path.exists():
+    if not qr_path.exists():
         try:
-            await update.message.reply_photo(
-                photo=qr_path,
-                caption=caption,
+            await update.message.reply_text(
+                "⚠️ *Payment QR is currently unavailable.*\n\n"
+                "Please contact the admin.",
                 parse_mode="Markdown",
-                reply_markup=payment_keyboard(),
             )
         except Exception as e:
-            logger.exception(
-                "Could not send QR image: %s",
-                e,
-            )
+            logger.exception("Failed to send unavailable QR message: %s", e)
+        return
 
+    try:
+        await update.message.reply_photo(
+            photo=qr_path,
+            caption=caption,
+            parse_mode="Markdown",
+            reply_markup=payment_keyboard(),
+        )
+    except Exception as e:
+        logger.exception("Failed to send QR image: %s", e)
+        try:
             await update.message.reply_text(
                 caption,
                 parse_mode="Markdown",
                 reply_markup=payment_keyboard(),
             )
-    else:
-        await update.message.reply_text(
-            "⚠️ *Payment QR is currently unavailable.*\n\n"
-            "Please contact the admin.",
-            parse_mode="Markdown",
-        )
+        except Exception as fallback_err:
+            logger.exception("Failed to send text fallback: %s", fallback_err)
 
 
+# 🔴 FIXED: Added try-except for database call; returns bool
 async def create_payment_claim(
     bot,
     user,
 ) -> bool:
-    """Send a payment claim to the admin."""
+    """Send a payment claim to the admin. Returns True if successful."""
+
+    if not user:
+        return False
 
     user_id = user.id
     display_name = user.full_name or "Unknown"
@@ -650,23 +780,30 @@ async def create_payment_claim(
         ]
     )
 
-    await bot.send_message(
-        chat_id=ADMIN_ID,
-        text=(
-            "💰 *NEW PAYMENT CLAIM*\n\n"
-            f"👤 *Name:* {display_name}\n"
-            f"🔗 *Username:* {username}\n"
-            f"🆔 *User ID:* `{user_id}`\n\n"
-            "📚 *Plan:* All Newspapers\n"
-            f"💵 *Amount:* {SUBSCRIPTION_PRICE}\n\n"
-            "Verify the payment in your UPI/bank app, "
-            "then press *APPROVE USER*."
-        ),
-        parse_mode="Markdown",
-        reply_markup=keyboard,
-    )
-
-    return True
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "💰 *NEW PAYMENT CLAIM*\n\n"
+                f"👤 *Name:* {display_name}\n"
+                f"🔗 *Username:* {username}\n"
+                f"🆔 *User ID:* `{user_id}`\n\n"
+                "📚 *Plan:* All Newspapers\n"
+                f"💵 *Amount:* {SUBSCRIPTION_PRICE}\n\n"
+                "Verify the payment in your UPI/bank app, "
+                "then press *APPROVE USER*."
+            ),
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        return True
+    except Exception as e:
+        logger.exception(
+            "Failed to send payment claim to admin for user %s: %s",
+            user_id,
+            e,
+        )
+        return False
 
 
 async def paid_command(
@@ -680,33 +817,33 @@ async def paid_command(
     if not user or not update.message:
         return
 
-    try:
-        await create_payment_claim(
-            context.bot,
-            user,
-        )
+    success = await create_payment_claim(
+        context.bot,
+        user,
+    )
 
-        await update.message.reply_text(
-            "✅ *Payment claim sent!*\n\n"
-            "Your payment will be verified by the admin.\n"
-            "Once approved, your *All Newspapers* subscription "
-            "will be active for 30 days.",
-            parse_mode="Markdown",
-        )
+    if success:
+        try:
+            await update.message.reply_text(
+                "✅ *Payment claim sent!*\n\n"
+                "Your payment will be verified by the admin.\n"
+                "Once approved, your *All Newspapers* subscription "
+                "will be active for 30 days.",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.exception("Failed to send payment confirmation: %s", e)
+    else:
+        try:
+            await update.message.reply_text(
+                "⚠️ We couldn't send your payment claim right now.\n"
+                "Please try again in a moment."
+            )
+        except Exception as e:
+            logger.exception("Failed to send error message: %s", e)
 
-    except Exception as e:
-        logger.exception(
-            "Could not send payment claim from %s: %s",
-            user.id,
-            e,
-        )
 
-        await update.message.reply_text(
-            "⚠️ We couldn't send your payment claim right now.\n"
-            "Please try again in a moment."
-        )
-
-
+# 🔴 FIXED: Added try-except for database call; improved date handling; use edit_message_text
 async def myplan_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -718,18 +855,51 @@ async def myplan_command(
     if not user:
         return
 
-    user_plans = await db.get_user_plans(user.id)
+    # 🔴 FIXED: Wrapped database call in try-except
+    try:
+        user_plans = await db.get_user_plans(user.id)
+    except Exception as e:
+        logger.exception("Failed to fetch user plans for %s: %s", user.id, e)
+        user_plans = None
 
     valid_expiries = []
 
-    for plan_data in user_plans or []:
-        expiry = plan_data.get("expiry_date")
+    if user_plans:
+        # 🔴 FIXED: Better date handling with logging
+        for plan_data in user_plans:
+            try:
+                expiry = plan_data.get("expiry_date")
 
-        if isinstance(expiry, datetime):
-            expiry = expiry.date()
+                if expiry is None:
+                    logger.warning(
+                        "Plan data missing expiry_date for user %s: %s",
+                        user.id,
+                        plan_data,
+                    )
+                    continue
 
-        if isinstance(expiry, date):
-            valid_expiries.append(expiry)
+                if isinstance(expiry, datetime):
+                    expiry = expiry.date()
+                elif isinstance(expiry, str):
+                    try:
+                        expiry = datetime.fromisoformat(expiry).date()
+                    except ValueError:
+                        logger.error(
+                            "Invalid expiry date format for user %s: %s",
+                            user.id,
+                            expiry,
+                        )
+                        continue
+
+                if isinstance(expiry, date):
+                    valid_expiries.append(expiry)
+            except Exception as e:
+                logger.exception(
+                    "Error processing plan data for user %s: %s",
+                    user.id,
+                    e,
+                )
+                continue
 
     if not valid_expiries:
         text = (
@@ -743,9 +913,7 @@ async def myplan_command(
         )
     else:
         expiry = max(valid_expiries)
-        days_left = (
-            expiry - date.today()
-        ).days
+        days_left = (expiry - date.today()).days
 
         if days_left < 0:
             text = (
@@ -778,18 +946,22 @@ async def myplan_command(
         ]
     )
 
-    if update.callback_query and update.callback_query.message:
-        await update.callback_query.message.reply_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=keyboard,
-        )
-    elif update.message:
-        await update.message.reply_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=keyboard,
-        )
+    try:
+        # 🔴 FIXED: Use edit_message_text for callbacks instead of reply_text
+        if update.callback_query and update.callback_query.message:
+            await update.callback_query.edit_message_text(
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        elif update.message:
+            await update.message.reply_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+    except Exception as e:
+        logger.exception("Failed to send myplan message for user %s: %s", user.id, e)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -809,10 +981,19 @@ async def customer_callback(
 
     data = query.data or ""
 
+    # ─────────────────────────────────────────────────────────────────
+    # BUY - Show payment QR
+    # ─────────────────────────────────────────────────────────────────
     if data == "buy":
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception as e:
+            logger.exception("Failed to answer buy callback: %s", e)
 
-        # Callback messages cannot use update.message.
+        if not query.message:
+            logger.warning("No message in buy callback query")
+            return
+
         qr_path = ASSETS_DIR / "qr.png"
 
         caption = (
@@ -826,79 +1007,95 @@ async def customer_callback(
             "Then press *I've Paid*."
         )
 
-        if query.message:
-            if qr_path.exists():
-                try:
-                    await query.message.reply_photo(
-                        photo=qr_path,
-                        caption=caption,
-                        parse_mode="Markdown",
-                        reply_markup=payment_keyboard(),
-                    )
-                except Exception as e:
-                    logger.exception(
-                        "Could not send callback QR: %s",
-                        e,
-                    )
-                    await query.message.reply_text(
-                        caption,
-                        parse_mode="Markdown",
-                        reply_markup=payment_keyboard(),
-                    )
-            else:
+        if not qr_path.exists():
+            try:
                 await query.message.reply_text(
-                    "⚠️ Payment QR is currently unavailable."
+                    "⚠️ Payment QR is currently unavailable. "
+                    "Please try again later."
                 )
+            except Exception as e:
+                logger.exception("Failed to send unavailable QR message: %s", e)
+            return
+
+        try:
+            await query.message.reply_photo(
+                photo=qr_path,
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=payment_keyboard(),
+            )
+        except Exception as e:
+            logger.exception("Failed to send QR photo in callback: %s", e)
+            try:
+                await query.message.reply_text(
+                    caption,
+                    parse_mode="Markdown",
+                    reply_markup=payment_keyboard(),
+                )
+            except Exception as fallback_err:
+                logger.exception("Failed to send text fallback: %s", fallback_err)
 
         return
 
+    # ─────────────────────────────────────────────────────────────────
+    # PAID - Create payment claim
+    # ─────────────────────────────────────────────────────────────────
     if data == "paid":
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception as e:
+            logger.exception("Failed to answer paid callback: %s", e)
 
         user = query.from_user
 
         if not user or not query.message:
+            logger.warning("Missing user or message in paid callback")
             return
 
-        try:
-            await create_payment_claim(
-                context.bot,
-                user,
-            )
+        success = await create_payment_claim(
+            context.bot,
+            user,
+        )
 
-            await query.message.reply_text(
-                "✅ *Payment claim sent!*\n\n"
-                "The admin will verify your payment and activate "
-                "your subscription after approval.",
-                parse_mode="Markdown",
-            )
-
-        except Exception as e:
-            logger.exception(
-                "Callback payment claim failed for %s: %s",
-                user.id,
-                e,
-            )
-
-            await query.message.reply_text(
-                "⚠️ We couldn't send your payment claim. "
-                "Please try again."
-            )
+        if success:
+            try:
+                await query.message.reply_text(
+                    "✅ *Payment claim sent!*\n\n"
+                    "The admin will verify your payment and activate "
+                    "your subscription after approval.",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.exception("Failed to send payment claim confirmation: %s", e)
+        else:
+            try:
+                await query.message.reply_text(
+                    "⚠️ We couldn't send your payment claim. "
+                    "Please try again."
+                )
+            except Exception as e:
+                logger.exception("Failed to send error message: %s", e)
 
         return
 
+    # ─────────────────────────────────────────────────────────────────
+    # MYPLAN - Show subscription status
+    # ─────────────────────────────────────────────────────────────────
     if data == "myplan":
-        await query.answer()
-        await myplan_command(
-            update,
-            context,
-        )
+        try:
+            await query.answer()
+        except Exception as e:
+            logger.exception("Failed to answer myplan callback: %s", e)
+
+        await myplan_command(update, context)
+        return
 
 
 # ─────────────────────────────────────────────────────────────────────
 # Paper broadcasting
 # ─────────────────────────────────────────────────────────────────────
 
+# 🔴 FIXED: Added database exception handling and null check
 async def broadcast_paper(
     bot,
     newspaper_code: str,
@@ -910,11 +1107,27 @@ async def broadcast_paper(
 
     Because approval activates all three internal entries, every active
     All Newspapers subscriber receives every newspaper.
+    
+    Returns the number of successful deliveries.
     """
 
-    active_users = await db.get_active_users(
-        plan=newspaper_code
-    )
+    try:
+        active_users = await db.get_active_users(plan=newspaper_code)
+    except Exception as e:
+        logger.exception(
+            "Failed to fetch active users for %s: %s",
+            newspaper_code,
+            e,
+        )
+        return 0
+
+    # 🔴 FIXED: Check if active_users is None or empty
+    if not active_users:
+        logger.info(
+            "No active users found for newspaper: %s",
+            newspaper_code,
+        )
+        return 0
 
     newspaper_name = NEWSPAPERS.get(
         newspaper_code,
@@ -925,8 +1138,14 @@ async def broadcast_paper(
 
     for user in active_users:
         try:
+            user_id = user.get("user_id")
+
+            if not user_id:
+                logger.warning("User record missing user_id: %s", user)
+                continue
+
             await bot.send_document(
-                chat_id=user["user_id"],
+                chat_id=user_id,
                 document=file_id,
                 caption=(
                     f"📰 *{newspaper_name}*\n"
@@ -941,7 +1160,7 @@ async def broadcast_paper(
             logger.error(
                 "Failed to send %s to user %s: %s",
                 newspaper_name,
-                user["user_id"],
+                user.get("user_id", "UNKNOWN"),
                 e,
             )
 
@@ -952,83 +1171,99 @@ async def broadcast_paper(
 # Scheduled jobs
 # ─────────────────────────────────────────────────────────────────────
 
+# 🔴 FIXED: Added comprehensive error handling
 async def send_pdfs_job(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Daily scheduled newspaper broadcast."""
 
-    logger.info(
-        "Running daily PDF broadcast job..."
-    )
+    logger.info("Running daily PDF broadcast job...")
 
-    papers = await db.get_todays_papers()
+    try:
+        papers = await db.get_todays_papers()
+    except Exception as e:
+        logger.exception("Failed to fetch today's papers: %s", e)
+        return
 
     if not papers:
-        logger.info(
-            "No papers uploaded for today. Skipping broadcast."
-        )
+        logger.info("No papers uploaded for today. Skipping broadcast.")
         return
 
     for paper in papers:
-        newspaper_code = paper["plan_name"]
-        file_id = paper["file_id"]
+        try:
+            newspaper_code = paper.get("plan_name")
+            file_id = paper.get("file_id")
 
-        count = await broadcast_paper(
-            context.bot,
-            newspaper_code,
-            file_id,
-        )
+            if not newspaper_code or not file_id:
+                logger.warning(
+                    "Paper record missing required fields: %s",
+                    paper,
+                )
+                continue
 
-        logger.info(
-            "Broadcast '%s' to %s subscriber(s).",
-            newspaper_code,
-            count,
-        )
+            count = await broadcast_paper(
+                context.bot,
+                newspaper_code,
+                file_id,
+            )
 
-    logger.info(
-        "Daily PDF broadcast complete."
-    )
+            logger.info(
+                "Broadcast '%s' to %s subscriber(s).",
+                newspaper_code,
+                count,
+            )
+        except Exception as e:
+            logger.exception(
+                "Failed to process paper in broadcast job: %s",
+                e,
+            )
+
+    logger.info("Daily PDF broadcast complete.")
 
 
+# 🔴 FIXED: Added error handling
 async def cleanup_users_job(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Remove expired subscription rows."""
 
-    logger.info(
-        "Running expired subscription cleanup..."
-    )
+    logger.info("Running expired subscription cleanup...")
 
-    deleted = await db.delete_expired_users()
-
-    logger.info(
-        "Cleanup complete. Removed %s expired row(s).",
-        deleted,
-    )
+    try:
+        deleted = await db.delete_expired_users()
+        logger.info(
+            "Cleanup complete. Removed %s expired row(s).",
+            deleted,
+        )
+    except Exception as e:
+        logger.exception("Failed to cleanup expired users: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────
 # Application lifecycle
 # ─────────────────────────────────────────────────────────────────────
 
+# 🔴 FIXED: Added error handling for database initialization
 async def post_init(application) -> None:
     """Initialize database."""
 
-    await db.init_db()
+    try:
+        await db.init_db()
+        logger.info("Bot started and database connected.")
+    except Exception as e:
+        logger.critical("Failed to initialize database: %s", e)
+        raise
 
-    logger.info(
-        "Bot started and database connected."
-    )
 
-
+# 🔴 FIXED: Added error handling for database close
 async def post_shutdown(application) -> None:
     """Close database."""
 
-    await db.close_db()
-
-    logger.info(
-        "Bot stopped and database disconnected."
-    )
+    try:
+        await db.close_db()
+        logger.info("Bot stopped and database disconnected.")
+    except Exception as e:
+        logger.exception("Failed to close database: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1048,15 +1283,20 @@ def health_check():
     }
 
 
+# 🔴 FIXED: Added error handling for uvicorn
 def run_dummy_server():
     """Run FastAPI health server on port 7860."""
 
-    uvicorn.run(
-        app_api,
-        host="0.0.0.0",
-        port=7860,
-        log_level="warning",
-    )
+    try:
+        uvicorn.run(
+            app_api,
+            host="0.0.0.0",
+            port=7860,
+            log_level="warning",
+        )
+    except Exception as e:
+        logger.critical("FastAPI server crashed: %s", e)
+        raise
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1088,9 +1328,7 @@ def build_application():
             "Please add PROXY_SECRET to Hugging Face Secrets."
         )
 
-    logger.info(
-        "🌐 Using Vercel Telegram proxy."
-    )
+    logger.info("🌐 Using Vercel Telegram proxy.")
 
     proxy_base = (
         f"{PROXY_URL.rstrip('/')}"
@@ -1155,99 +1393,60 @@ def register_handlers(application):
         ],
     )
 
-    application.add_handler(
-        pdf_upload_handler
-    )
+    application.add_handler(pdf_upload_handler)
 
-    # Admin commands.
+    # Admin commands
     application.add_handler(
-        CommandHandler(
-            "approve",
-            approve_command,
-        )
+        CommandHandler("approve", approve_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "debug",
-            debug_command,
-        )
+        CommandHandler("debug", debug_command)
     )
 
-    # Customer commands.
+    # Customer commands
     application.add_handler(
-        CommandHandler(
-            "start",
-            start_command,
-        )
+        CommandHandler("start", start_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "buy",
-            buy_command,
-        )
+        CommandHandler("buy", buy_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "paid",
-            paid_command,
-        )
+        CommandHandler("paid", paid_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "myplan",
-            myplan_command,
-        )
+        CommandHandler("myplan", myplan_command)
     )
 
-    # Compatibility aliases for users who still have the old commands.
+    # Compatibility aliases for users who still have old commands
     application.add_handler(
-        CommandHandler(
-            "buyhindu",
-            buy_command,
-        )
+        CommandHandler("buyhindu", buy_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "buytoi",
-            buy_command,
-        )
+        CommandHandler("buytoi", buy_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "buyie",
-            buy_command,
-        )
+        CommandHandler("buyie", buy_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "paidhindu",
-            paid_command,
-        )
+        CommandHandler("paidhindu", paid_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "paidtoi",
-            paid_command,
-        )
+        CommandHandler("paidtoi", paid_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "paidie",
-            paid_command,
-        )
+        CommandHandler("paidie", paid_command)
     )
 
-    # Admin approval button MUST be registered before general customer
-    # callbacks.
+    # Admin approval button MUST be registered before general customer callbacks
     application.add_handler(
         CallbackQueryHandler(
             approve_callback,
@@ -1262,29 +1461,38 @@ def register_handlers(application):
         )
     )
 
+    # Register scheduled jobs
     job_queue = application.job_queue
 
     if job_queue is None:
+        logger.critical(
+            "JobQueue not available. Install with: "
+            "pip install python-telegram-bot[job-queue]"
+        )
         raise RuntimeError(
-            "JobQueue is not available. "
-            "Install python-telegram-bot with the job-queue extra."
+            "JobQueue is required but not installed. "
+            "Install with: pip install python-telegram-bot[job-queue]"
         )
 
-    job_queue.run_daily(
-        send_pdfs_job,
-        time=IST_BROADCAST_TIME,
-        name="daily_broadcast",
-    )
+    try:
+        job_queue.run_daily(
+            send_pdfs_job,
+            time=IST_BROADCAST_TIME,
+            name="daily_broadcast",
+        )
 
-    job_queue.run_daily(
-        cleanup_users_job,
-        time=IST_CLEANUP_TIME,
-        name="daily_cleanup",
-    )
+        job_queue.run_daily(
+            cleanup_users_job,
+            time=IST_CLEANUP_TIME,
+            name="daily_cleanup",
+        )
 
-    logger.info(
-        "All handlers and scheduled jobs registered."
-    )
+        logger.info(
+            "All handlers and scheduled jobs registered successfully."
+        )
+    except Exception as e:
+        logger.critical("Failed to register scheduled jobs: %s", e)
+        raise
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1304,33 +1512,57 @@ def main() -> None:
             "ADMIN_ID is not set in environment variables."
         )
 
-    threading.Thread(
-        target=run_dummy_server,
-        daemon=True,
-    ).start()
+    # Start FastAPI health server in background
+    try:
+        threading.Thread(
+            target=run_dummy_server,
+            daemon=True,
+        ).start()
 
-    logger.info(
-        "Started FastAPI health server on port 7860."
-    )
+        logger.info("Started FastAPI health server on port 7860.")
+    except Exception as e:
+        logger.exception("Failed to start health server: %s", e)
 
-    logger.info(
-        "Building Telegram application..."
-    )
+    logger.info("Building Telegram application...")
 
-    application = build_application()
+    # 🔴 FIXED: Added error handling for build and register
+    try:
+        application = build_application()
+    except ValueError as e:
+        logger.critical("Configuration error: %s", e)
+        raise
 
-    # Register EVERYTHING before polling.
-    register_handlers(application)
+    # Register EVERYTHING before polling
+    try:
+        register_handlers(application)
+    except Exception as e:
+        logger.critical("Failed to register handlers: %s", e)
+        raise
 
-    logger.info(
-        "🚀 Telegram bot is starting polling..."
-    )
+    logger.info("🚀 Telegram bot is starting polling...")
 
-    # Exactly one polling call.
-    application.run_polling(
-        drop_pending_updates=True
-    )
+    try:
+        # Exactly one polling call
+        application.run_polling(drop_pending_updates=True)
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
+    except Exception as e:
+        logger.critical("Bot crashed: %s", e)
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    import traceback
+
+    try:
+        main()
+    except Exception:
+        logger.critical(
+            "FATAL: Bot crashed on startup:\n%s",
+            traceback.format_exc(),
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise
+    
